@@ -293,6 +293,14 @@ fn generate_witness_text(
         .context("error instantiating witness template")
 }
 
+/// Creates an empty witness report for the given crate and witness data.
+pub(crate) fn empty_witness_report(
+    crate_name: &str,
+    witness_data: &WitnessGenerationData<'_>,
+) -> WitnessRunReport {
+    WitnessRunReport::empty(crate_name, witness_data.target_dir.clone())
+}
+
 /// Runs witnesses as a second pass over lint query results and rewrites each
 /// lint's authoritative result set accordingly.
 ///
@@ -308,7 +316,7 @@ pub(crate) fn run_witness_checks(
     adapter: &VersionedRustdocAdapter,
     lint_results: &mut [LintResult],
 ) -> WitnessRunReport {
-    let mut report = WitnessRunReport::empty(crate_name, witness_data.target_dir.clone());
+    let mut report = empty_witness_report(crate_name, &witness_data);
     let mut not_confirmed_by_witness = 0usize;
     let mut consistency_check_mismatches = 0usize;
     let mut consistency_check_errors = 0usize;

@@ -326,9 +326,6 @@ pub(super) fn run_check_release(
         VersionChangeKind::Minimum => format!("no change; {assume}{change}"),
     };
 
-    let index_storage = data_storage.create_indexes(rustdoc_indexing_mode);
-    let adapter = index_storage.create_adapter();
-
     let mut queries_to_run = SemverQuery::all_queries();
     let all_queries_len = queries_to_run.len();
     queries_to_run.retain(|_, query| {
@@ -339,6 +336,13 @@ pub(super) fn run_check_release(
     });
     let selected_checks = queries_to_run.len();
     let skipped_checks = all_queries_len - selected_checks;
+
+    let index_storage = if selected_checks > 0 {
+        Some(data_storage.create_indexes(rustdoc_indexing_mode))
+    } else {
+        None
+    };
+    let adapter = index_storage.as_ref().map(|index| index.create_adapter());
 
     config.shell_status(
         "Checking",
@@ -370,34 +374,40 @@ pub(super) fn run_check_release(
         .expect("print failed");
 
     let checks_start_instant = Instant::now();
-    let mut lint_results = queries_to_run
-        .into_par_iter()
-        .map(|(_, semver_query)| {
-            let start_instant = std::time::Instant::now();
-            // trustfall::execute_query(...) -> dyn Iterator (without Send)
-            // thus the result must be collect()'ed
-            let query_results = adapter
-                .run_query(&semver_query.query, semver_query.arguments.clone())?
-                .collect_vec();
-            let query_duration = start_instant.elapsed();
-            Ok(LintResult {
-                effective_required_update: overrides.effective_required_update(&semver_query),
-                effective_lint_level: overrides.effective_lint_level(&semver_query),
-                semver_query,
-                query_duration,
-                query_results,
+    let mut lint_results = match adapter.as_ref() {
+        Some(adapter) => queries_to_run
+            .into_par_iter()
+            .map(|(_, semver_query)| {
+                let start_instant = std::time::Instant::now();
+                // trustfall::execute_query(...) -> dyn Iterator (without Send)
+                // thus the result must be collect()'ed
+                let query_results = adapter
+                    .run_query(&semver_query.query, semver_query.arguments.clone())?
+                    .collect_vec();
+                let query_duration = start_instant.elapsed();
+                Ok(LintResult {
+                    effective_required_update: overrides.effective_required_update(&semver_query),
+                    effective_lint_level: overrides.effective_lint_level(&semver_query),
+                    semver_query,
+                    query_duration,
+                    query_results,
+                })
             })
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
+            .collect::<anyhow::Result<Vec<_>>>()?,
+        None => Vec::new(),
+    };
 
-    let witness_run_report = witness_gen::run_witness_checks(
-        config,
-        witness_generation,
-        witness_data,
-        crate_name,
-        &adapter,
-        &mut lint_results,
-    );
+    let witness_run_report = match adapter.as_ref() {
+        Some(adapter) => witness_gen::run_witness_checks(
+            config,
+            witness_generation,
+            witness_data,
+            crate_name,
+            adapter,
+            &mut lint_results,
+        ),
+        None => witness_gen::empty_witness_report(crate_name, &witness_data),
+    };
 
     let checks_duration = checks_start_instant.elapsed();
 
