@@ -60,6 +60,11 @@ impl<'a> WitnessGenerationData<'a> {
         }
     }
 
+    /// Builds an empty [`WitnessRunReport`] for a given crate.
+    pub(crate) fn empty_run_report(&self, crate_name: &str) -> WitnessRunReport {
+        WitnessRunReport::empty(crate_name, self.target_dir.clone())
+    }
+
     fn requested_build_target(&self) -> Result<Option<&str>> {
         let baseline_target = self.baseline.and_then(CrateDataRequest::build_target);
         let current_target = self.current.and_then(CrateDataRequest::build_target);
@@ -308,7 +313,7 @@ pub(crate) fn run_witness_checks(
     adapter: &VersionedRustdocAdapter,
     lint_results: &mut [LintResult],
 ) -> WitnessRunReport {
-    let mut report = WitnessRunReport::empty(crate_name, witness_data.target_dir.clone());
+    let mut report = witness_data.empty_run_report(crate_name);
     let mut not_confirmed_by_witness = 0usize;
     let mut consistency_check_mismatches = 0usize;
     let mut consistency_check_errors = 0usize;

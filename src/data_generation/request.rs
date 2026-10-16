@@ -267,6 +267,10 @@ impl<'a> CrateDataRequest<'a> {
         Ok(format!("={}", self.kind.version()?.as_ref()))
     }
 
+    pub(crate) fn version(&self) -> anyhow::Result<Cow<'_, str>> {
+        self.kind.version()
+    }
+
     pub(crate) fn local_project_dir(&self) -> anyhow::Result<Option<PathBuf>> {
         match &self.kind {
             RequestKind::Registry(..) => Ok(None),

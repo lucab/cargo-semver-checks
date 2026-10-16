@@ -634,22 +634,44 @@ note: skipped the following crates since they have no library target: {skipped}"
                     witness_target_dir.clone(),
                 );
 
-                let data_storage = generate_crate_data(
-                    config,
-                    generation_settings,
-                    &current_loader,
-                    &baseline_loader,
-                )
-                .map_err(|err| log_terminal_error(config, err))?;
+                let baseline_version = baseline_loader
+                    .get_data_request()
+                    .map(|request| request.version())
+                    .transpose()?
+                    .map(|version| version.into_owned());
+                let current_version = current_loader
+                    .get_data_request()
+                    .map(|request| request.version())
+                    .transpose()?
+                    .map(|version| version.into_owned());
+
+                let settings = CheckReleaseSettings {
+                    release_type: self.release_type,
+                    rustdoc_indexing_mode: self.rustdoc_indexing_mode,
+                    baseline_version,
+                    current_version,
+                };
+
+                let needs_rustdoc_data =
+                    check_release::needs_rustdoc_generation(&settings, &selected.overrides);
+                let maybe_data_storage = if needs_rustdoc_data {
+                    let crate_data = generate_crate_data(
+                        config,
+                        generation_settings,
+                        &current_loader,
+                        &baseline_loader,
+                    )
+                    .map_err(|err| log_terminal_error(config, err))?;
+                    Some(crate_data)
+                } else {
+                    None
+                };
 
                 let report = run_check_release(
                     config,
-                    &data_storage,
                     &name,
-                    CheckReleaseSettings {
-                        release_type: self.release_type,
-                        rustdoc_indexing_mode: self.rustdoc_indexing_mode,
-                    },
+                    maybe_data_storage,
+                    settings,
                     &selected.overrides,
                     &self.witness_generation,
                     witness_data,

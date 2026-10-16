@@ -265,12 +265,61 @@ fn print_triggered_lint(
 pub(super) struct CheckReleaseSettings {
     pub(super) release_type: Option<ReleaseType>,
     pub(super) rustdoc_indexing_mode: RustdocIndexingMode,
+    pub(super) baseline_version: Option<String>,
+    pub(super) current_version: Option<String>,
+}
+
+fn is_selected_query(
+    version_change: &VersionChange,
+    overrides: &OverrideStack,
+    query: &SemverQuery,
+) -> bool {
+    !version_change
+        .level
+        .supports_requirement(overrides.effective_required_update(query))
+        && overrides.effective_lint_level(query) > LintLevel::Allow
+}
+
+fn early_version_change(
+    release_type: Option<ReleaseType>,
+    baseline_version: Option<&str>,
+    current_version: Option<&str>,
+) -> Option<VersionChange> {
+    match release_type {
+        Some(rt) => Some(VersionChange {
+            level: rt.into(),
+            kind: VersionChangeKind::Actual,
+        }),
+        None => match (baseline_version, current_version) {
+            (Some(baseline), Some(current)) => {
+                Some(classify_minimum_semver_version_change(baseline, current))
+            }
+            _ => None,
+        },
+    }
+}
+
+pub(super) fn needs_rustdoc_generation(
+    settings: &CheckReleaseSettings,
+    overrides: &OverrideStack,
+) -> bool {
+    let change_guess = early_version_change(
+        settings.release_type,
+        settings.baseline_version.as_deref(),
+        settings.current_version.as_deref(),
+    );
+    match change_guess {
+        Some(version_change) => SemverQuery::all_queries()
+            .values()
+            .any(|query| is_selected_query(&version_change, overrides, query)),
+        None => true,
+    }
 }
 
 pub(super) fn run_check_release(
     config: &mut GlobalConfig,
-    data_storage: &DataStorage,
     crate_name: &str,
+    data_storage: Option<DataStorage>,
     settings: CheckReleaseSettings,
     overrides: &OverrideStack,
     witness_generation: &WitnessGeneration,
@@ -279,36 +328,33 @@ pub(super) fn run_check_release(
     let CheckReleaseSettings {
         release_type,
         rustdoc_indexing_mode,
+        baseline_version,
+        current_version,
     } = settings;
 
-    let current_version = data_storage.current_crate().crate_version();
-    let baseline_version = data_storage.baseline_crate().crate_version();
+    let baseline_version = baseline_version.as_deref().or_else(|| {
+        data_storage
+            .as_ref()
+            .and_then(|storage| storage.baseline_crate().crate_version())
+    });
+    let current_version = current_version.as_deref().or_else(|| {
+        data_storage
+            .as_ref()
+            .and_then(|storage| storage.current_crate().crate_version())
+    });
 
-    let version_change = match release_type {
-        // Case 1: User explicitly specified a release type
-        Some(rt) => VersionChange {
-            level: rt.into(),
-            kind: VersionChangeKind::Actual,
-        },
-        // Case 2: Try to determine from version strings
-        None => match (baseline_version, current_version) {
-            (Some(baseline), Some(current)) => {
-                classify_minimum_semver_version_change(baseline, current)
+    let version_change = early_version_change(release_type, baseline_version, current_version)
+        .unwrap_or_else(|| {
+            config
+                .shell_warn(
+                    "Could not determine whether crate version changed. Assuming no change.",
+                )
+                .expect("print failed");
+            VersionChange {
+                level: ActualSemverUpdate::NotChanged,
+                kind: VersionChangeKind::Actual,
             }
-            // Case 3: Fall back to assuming no change
-            _ => {
-                config
-                    .shell_warn(
-                        "Could not determine whether crate version changed. Assuming no change.",
-                    )
-                    .expect("print failed");
-                VersionChange {
-                    level: ActualSemverUpdate::NotChanged,
-                    kind: VersionChangeKind::Actual,
-                }
-            }
-        },
-    };
+        });
     let change = match version_change.level {
         ActualSemverUpdate::Major => "major",
         ActualSemverUpdate::Minor => "minor",
@@ -326,17 +372,9 @@ pub(super) fn run_check_release(
         VersionChangeKind::Minimum => format!("no change; {assume}{change}"),
     };
 
-    let index_storage = data_storage.create_indexes(rustdoc_indexing_mode);
-    let adapter = index_storage.create_adapter();
-
     let mut queries_to_run = SemverQuery::all_queries();
     let all_queries_len = queries_to_run.len();
-    queries_to_run.retain(|_, query| {
-        !version_change
-            .level
-            .supports_requirement(overrides.effective_required_update(query))
-            && overrides.effective_lint_level(query) > LintLevel::Allow
-    });
+    queries_to_run.retain(|_, query| is_selected_query(&version_change, overrides, query));
     let selected_checks = queries_to_run.len();
     let skipped_checks = all_queries_len - selected_checks;
 
@@ -370,34 +408,45 @@ pub(super) fn run_check_release(
         .expect("print failed");
 
     let checks_start_instant = Instant::now();
-    let mut lint_results = queries_to_run
-        .into_par_iter()
-        .map(|(_, semver_query)| {
-            let start_instant = std::time::Instant::now();
-            // trustfall::execute_query(...) -> dyn Iterator (without Send)
-            // thus the result must be collect()'ed
-            let query_results = adapter
-                .run_query(&semver_query.query, semver_query.arguments.clone())?
-                .collect_vec();
-            let query_duration = start_instant.elapsed();
-            Ok(LintResult {
-                effective_required_update: overrides.effective_required_update(&semver_query),
-                effective_lint_level: overrides.effective_lint_level(&semver_query),
-                semver_query,
-                query_duration,
-                query_results,
-            })
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
+    let (lint_results, witness_run_report) = match data_storage {
+        Some(data_storage) if selected_checks > 0 => {
+            let index_storage = data_storage.create_indexes(rustdoc_indexing_mode);
+            let adapter = index_storage.create_adapter();
 
-    let witness_run_report = witness_gen::run_witness_checks(
-        config,
-        witness_generation,
-        witness_data,
-        crate_name,
-        &adapter,
-        &mut lint_results,
-    );
+            let mut lint_results = queries_to_run
+                .into_par_iter()
+                .map(|(_, semver_query)| {
+                    let start_instant = std::time::Instant::now();
+                    // trustfall::execute_query(...) -> dyn Iterator (without Send)
+                    // thus the result must be collect()'ed
+                    let query_results = adapter
+                        .run_query(&semver_query.query, semver_query.arguments.clone())?
+                        .collect_vec();
+                    let query_duration = start_instant.elapsed();
+                    Ok(LintResult {
+                        effective_required_update: overrides
+                            .effective_required_update(&semver_query),
+                        effective_lint_level: overrides.effective_lint_level(&semver_query),
+                        semver_query,
+                        query_duration,
+                        query_results,
+                    })
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+
+            let witness_run_report = witness_gen::run_witness_checks(
+                config,
+                witness_generation,
+                witness_data,
+                crate_name,
+                &adapter,
+                &mut lint_results,
+            );
+
+            (lint_results, witness_run_report)
+        }
+        _ => (Vec::new(), witness_data.empty_run_report(crate_name)),
+    };
 
     let checks_duration = checks_start_instant.elapsed();
 
